@@ -1,219 +1,584 @@
-# ╔══════════════════════════════════════════════════════════════════════════════╗
-# ║  DataQuery — Production FastAPI Backend                                      ║
-# ║  Single-file · All sources · AI query generation · Export · History          ║
-# ╚══════════════════════════════════════════════════════════════════════════════╝
-#
-#  Run:  uvicorn app:app --host 0.0.0.0 --port 8000 --reload
-#  Docs: http://localhost:8000/docs
-# ──────────────────────────────────────────────────────────────────────────────
+
 
 from __future__ import annotations
 
 import io
 import json
 import logging
+import math
+import os
 import re
 import sqlite3
+import tempfile
 import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
-from dotenv import load_dotenv
 
-# ── FastAPI ───────────────────────────────────────────────────────────────────
-from fastapi import (
-    BackgroundTasks,
-    FastAPI,
-    File,
-    Form,
-    HTTPException,
-    Query,
-    Request,
-    UploadFile,
-)
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
-
-# ── Pydantic ──────────────────────────────────────────────────────────────────
-from pydantic import BaseModel, Field, validator
-
-# ── Data / DB ─────────────────────────────────────────────────────────────────
+import numpy as np
 import pandas as pd
 import httpx
-
-# Optional heavy deps — imported lazily so the app starts even if not installed
-try:
-    import pdfplumber
-    _PDF_OK = True
-except ImportError:
-    _PDF_OK = False
-
-try:
-    import psycopg2
-    import psycopg2.extras
-    _PG_OK = True
-except ImportError:
-    _PG_OK = False
-
-try:
-    import pymysql
-    import pymysql.cursors
-    _MYSQL_OK = True
-except ImportError:
-    _MYSQL_OK = False
-
-try:
-    import pymongo
-    from bson import ObjectId
-    _MONGO_OK = True
-except ImportError:
-    _MONGO_OK = False
-
-try:
-    from google.cloud import bigquery as bq
-    _BQ_OK = True
-except ImportError:
-    _BQ_OK = False
-
-# ── Export ────────────────────────────────────────────────────────────────────
+from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4, landscape
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle
 
+# ── Optional heavy deps ───────────────────────────────────────────────────────
+try:
+    import pdfplumber;      _PDF   = True
+except ImportError:         _PDF   = False
+try:
+    import psycopg2, psycopg2.extras; _PG   = True
+except ImportError:         _PG    = False
+try:
+    import pymysql, pymysql.cursors;  _MY   = True
+except ImportError:         _MY    = False
+try:
+    import pymongo;         _MONGO = True
+except ImportError:         _MONGO = False
+try:
+    from google.cloud import bigquery as _bq; _BQ = True
+except ImportError:         _BQ    = False
+try:
+    from sklearn.metrics.pairwise import cosine_similarity; _SK = True
+except ImportError:         _SK    = False
+
 # ── Logging ───────────────────────────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(levelname)-8s  %(name)s — %(message)s",
-)
+logging.basicConfig(level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s  %(name)s — %(message)s")
 log = logging.getLogger("dataquery")
+import os
+from dotenv import load_dotenv
+load_dotenv()  # take environment variables from .env file if present
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  GLOBAL IN-MEMORY STORES
-# ══════════════════════════════════════════════════════════════════════════════
+# ── Config ────────────────────────────────────────────────────────────────────
+OPENAI_API_KEY    = os.getenv("OPENAI_API_KEY", "")
+OPENAI_MODEL      = os.getenv("OPENAI_MODEL",   "gpt-4o-mini")
+EMBED_MODEL       = os.getenv("EMBED_MODEL",    "text-embedding-3-small")
+LLM_PROVIDER      = os.getenv("LLM_PROVIDER",  "openai")   # openai|anthropic|stub
+ANTHROPIC_KEY     = os.getenv("ANTHROPIC_API_KEY", "")
+ANTHROPIC_MODEL   = os.getenv("ANTHROPIC_MODEL", "claude-3-haiku-20240307")
+QUERY_TIMEOUT     = int(os.getenv("QUERY_TIMEOUT", "30"))
+CHUNK_SIZE        = int(os.getenv("CHUNK_SIZE",    "400"))   # words per chunk
+CHUNK_OVERLAP     = int(os.getenv("CHUNK_OVERLAP", "80"))
+TOP_K_CHUNKS      = int(os.getenv("TOP_K_CHUNKS",  "6"))
+MAX_DF_ROWS_AI    = int(os.getenv("MAX_DF_ROWS_AI","200"))   # rows sent to LLM
 
-SOURCES:   Dict[str, dict] = {}   # source_id → source meta + data
-HISTORY:   List[dict]      = []   # query history (newest first)
-MAX_HIST   = 200                  # cap history to 200 entries
-QUERY_TIMEOUT = 30                # seconds – SQL / HTTP timeout
+# ═════════════════════════════════════════════════════════════════════════════
+#  IN-MEMORY STORES
+# ═════════════════════════════════════════════════════════════════════════════
+SOURCES:  Dict[str, dict] = {}
+HISTORY:  List[dict]      = []
+MAX_HIST  = 200
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  LIFESPAN
-# ══════════════════════════════════════════════════════════════════════════════
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    log.info("DataQuery API starting up …")
-    yield
-    log.info("DataQuery API shutting down …")
-
-# ══════════════════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════
 #  APP
-# ══════════════════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════
+@asynccontextmanager
+async def lifespan(app):
+    log.info("DataQuery Universal AI Engine starting …")
+    yield
+    log.info("Shutting down …")
 
 app = FastAPI(
-    title="DataQuery API",
-    description=(
-        "Universal AI-powered data query backend.\n\n"
-        "Supports PostgreSQL, MySQL, MongoDB, SQLite, BigQuery, "
-        "Excel/CSV, PDF, and REST APIs."
-    ),
-    version="2.0.0",
+    title="DataQuery Universal AI Engine",
+    description="Ask questions in plain English. No SQL. No pipelines. Just answers.",
+    version="3.0.0",
     lifespan=lifespan,
 )
+app.add_middleware(CORSMiddleware, allow_origins=["*"],
+    allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],          # ← restrict to your frontend URL in prod
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# ══════════════════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════
 #  PYDANTIC MODELS
-# ══════════════════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════
 
-# ─── Source connection request models ────────────────────────────────────────
-
-class PostgresConnect(BaseModel):
-    name:     str
-    host:     str
-    port:     int   = 5432
-    database: str
-    username: str
-    password: str
-    ssl:      bool  = False
-
-class MySQLConnect(BaseModel):
-    name:     str
-    host:     str
-    port:     int   = 3306
-    database: str
-    username: str
-    password: str
-
-class MongoConnect(BaseModel):
-    name:       str
-    uri:        str = Field(..., example="mongodb://localhost:27017")
-    database:   str
-    collection: Optional[str] = None
-
-class APIConnect(BaseModel):
-    name:    str
-    url:     str
-    method:  str              = "GET"
-    headers: Dict[str, str]   = {}
-    params:  Dict[str, str]   = {}
-    body:    Optional[str]    = None
-
-class BigQueryConnect(BaseModel):
-    name:        str
-    project_id:  str
-    dataset_id:  str
-    credentials: Optional[str] = None   # JSON string of service-account key
-
-# ─── Query models ─────────────────────────────────────────────────────────────
-
-class RunQueryRequest(BaseModel):
+class AskRequest(BaseModel):
+    """The one and only query endpoint — user sends a plain-English question."""
     source_id:  str
-    query:      str
-    query_type: str = "natural_language"   # sql | mongodb | api | natural_language
+    question:   str
     limit:      int = 1000
 
-class AIGenerateRequest(BaseModel):
-    source_id: str
-    prompt:    str
+class ConnectPostgres(BaseModel):
+    name: str; host: str; port: int = 5432
+    database: str; username: str; password: str; ssl: bool = False
 
-# ─── History model ────────────────────────────────────────────────────────────
+class ConnectMySQL(BaseModel):
+    name: str; host: str; port: int = 3306
+    database: str; username: str; password: str
 
-class HistoryEntry(BaseModel):
-    source_id:      str
-    query:          str
-    query_type:     str
-    rows_returned:  int
-    execution_time: float
-    success:        bool
-    error:          Optional[str] = None
+class ConnectMongo(BaseModel):
+    name: str; uri: str; database: str; collection: Optional[str] = None
 
-# ─── Export model ─────────────────────────────────────────────────────────────
+class ConnectAPI(BaseModel):
+    name: str; url: str; method: str = "GET"
+    headers: Dict[str, str] = {}; params: Dict[str, str] = {}
+
+class ConnectBigQuery(BaseModel):
+    name: str; project_id: str; dataset_id: str
+    credentials: Optional[str] = None
 
 class ExportRequest(BaseModel):
-    rows:    List[Dict[str, Any]]
-    columns: List[str]
-    filename: Optional[str] = "export"
+    rows: List[Dict[str, Any]]; columns: List[str]; filename: str = "export"
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  HELPER UTILITIES
-# ══════════════════════════════════════════════════════════════════════════════
+class HistoryEntry(BaseModel):
+    source_id: str; question: str; answer: str
+    rows_used: int = 0; execution_time: float = 0; success: bool = True
+    error: Optional[str] = None
 
-def new_id() -> str:
-    return str(uuid.uuid4())
+# ═════════════════════════════════════════════════════════════════════════════
+#  LLM LAYER  —  provider-agnostic, swappable
+# ═════════════════════════════════════════════════════════════════════════════
 
-def now_iso() -> str:
-    return datetime.utcnow().isoformat() + "Z"
+async def llm_chat(system: str, user: str, max_tokens: int = 1500) -> str:
+    """Call the configured LLM and return the assistant reply."""
+    if LLM_PROVIDER == "stub" or not OPENAI_API_KEY:
+        return "I don't have an API key configured yet. Please set OPENAI_API_KEY."
 
-def pandas_dtype_label(dtype) -> str:
+    if LLM_PROVIDER == "anthropic":
+        async with httpx.AsyncClient(timeout=60) as c:
+            r = await c.post("https://api.anthropic.com/v1/messages",
+                headers={"x-api-key": ANTHROPIC_KEY,
+                         "anthropic-version": "2023-06-01",
+                         "content-type": "application/json"},
+                json={"model": ANTHROPIC_MODEL, "max_tokens": max_tokens,
+                      "system": system,
+                      "messages": [{"role": "user", "content": user}]})
+        r.raise_for_status()
+        return r.json()["content"][0]["text"].strip()
+
+    # default: OpenAI
+    async with httpx.AsyncClient(timeout=60) as c:
+        r = await c.post("https://api.openai.com/v1/chat/completions",
+            headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+            json={"model": OPENAI_MODEL, "max_tokens": max_tokens,
+                  "temperature": 0,
+                  "messages": [{"role": "system", "content": system},
+                                {"role": "user",   "content": user}]})
+    r.raise_for_status()
+    return r.json()["choices"][0]["message"]["content"].strip()
+
+async def llm_embed(texts: List[str]) -> List[List[float]]:
+    """Get embeddings for a list of strings (OpenAI only; fallback = TF-IDF)."""
+    if not OPENAI_API_KEY or LLM_PROVIDER != "openai":
+        return _tfidf_embed(texts)
+    async with httpx.AsyncClient(timeout=60) as c:
+        r = await c.post("https://api.openai.com/v1/embeddings",
+            headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+            json={"model": EMBED_MODEL, "input": texts})
+    r.raise_for_status()
+    return [item["embedding"] for item in r.json()["data"]]
+
+# ── TF-IDF fallback embedder (no external deps beyond numpy) ─────────────────
+_TFIDF_VOCAB: Dict[str, int] = {}
+
+def _tfidf_embed(texts: List[str]) -> List[List[float]]:
+    """Deterministic TF-IDF vectors used when no OpenAI key is present."""
+    global _TFIDF_VOCAB
+    tokenised = [re.findall(r"[a-z0-9]+", t.lower()) for t in texts]
+    all_words  = {w for toks in tokenised for w in toks}
+    _TFIDF_VOCAB.update({w: i for i, w in enumerate(all_words) if w not in _TFIDF_VOCAB})
+    V = len(_TFIDF_VOCAB)
+    result = []
+    for toks in tokenised:
+        vec = np.zeros(V)
+        for w in toks:
+            if w in _TFIDF_VOCAB:
+                vec[_TFIDF_VOCAB[w]] += 1
+        norm = np.linalg.norm(vec)
+        result.append((vec / norm if norm else vec).tolist())
+    return result
+
+def _cosine(a: List[float], b: List[float]) -> float:
+    a, b = np.array(a), np.array(b)
+    n = np.linalg.norm(a) * np.linalg.norm(b)
+    return float(np.dot(a, b) / n) if n else 0.0
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  RAG ENGINE  —  used for PDF (and any chunk-based source)
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _chunk_text(text: str, size: int = CHUNK_SIZE,
+                overlap: int = CHUNK_OVERLAP) -> List[str]:
+    words  = text.split()
+    chunks, i = [], 0
+    while i < len(words):
+        chunks.append(" ".join(words[i: i + size]))
+        i += size - overlap
+    return chunks
+
+async def _build_vector_store(chunks: List[str]) -> Tuple[List[str], List[List[float]]]:
+    embeddings = await llm_embed(chunks)
+    return chunks, embeddings
+
+async def _retrieve(question: str,
+                    chunks: List[str],
+                    embeddings: List[List[float]],
+                    k: int = TOP_K_CHUNKS) -> List[str]:
+    q_emb = (await llm_embed([question]))[0]
+    scored = [(i, _cosine(q_emb, e)) for i, e in enumerate(embeddings)]
+    scored.sort(key=lambda x: x[1], reverse=True)
+    return [chunks[i] for i, _ in scored[:k]]
+
+async def answer_pdf(source: dict, question: str) -> dict:
+    """RAG pipeline for PDF sources."""
+    t0     = time.time()
+    chunks = source.get("chunks", [])
+    embeds = source.get("embeddings", [])
+
+    if not chunks:
+        # first call — build the store and cache it
+        full_text = source.get("full_text", "")
+        if not full_text:
+            return _err("PDF has no extracted text.")
+        chunks = _chunk_text(full_text)
+        chunks, embeds = await _build_vector_store(chunks)
+        source["chunks"]     = chunks
+        source["embeddings"] = embeds
+        log.info("Built vector store: %d chunks", len(chunks))
+
+    top_chunks = await _retrieve(question, chunks, embeds)
+    context    = "\n\n---\n\n".join(top_chunks)
+
+    system = (
+        "You are an expert document analyst. "
+        "Answer the user's question using ONLY the document excerpts below. "
+        "Be concise, accurate, and factual. "
+        "If the answer is not in the excerpts, say 'Not found in document'.\n\n"
+        f"DOCUMENT EXCERPTS:\n{context}"
+    )
+    answer = await llm_chat(system, question)
+    return {
+        "success":        True,
+        "answer":         answer,
+        "source_type":    "pdf",
+        "rows_used":      len(top_chunks),
+        "execution_time": round(time.time() - t0, 4),
+        "metadata":       {"chunks_searched": len(chunks), "chunks_used": len(top_chunks)},
+    }
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  DATAFRAME AGENT  —  Excel / CSV / API / SQLite flat results
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _df_summary(df: pd.DataFrame, max_rows: int = MAX_DF_ROWS_AI) -> str:
+    """Compact text representation of a dataframe sent to the LLM."""
+    schema = "\n".join(
+        f"  {col} ({str(df[col].dtype)}) — sample: {df[col].dropna().iloc[0] if not df[col].dropna().empty else 'N/A'}"
+        for col in df.columns
+    )
+    sample = df.head(max_rows).fillna("").to_csv(index=False)
+    return (
+        f"Shape: {df.shape[0]} rows × {df.shape[1]} columns\n"
+        f"Columns:\n{schema}\n\n"
+        f"Data (first {min(max_rows, len(df))} rows):\n{sample}"
+    )
+
+async def answer_dataframe(source: dict, question: str, source_type: str) -> dict:
+    """LLM reasons directly over a pandas dataframe."""
+    t0 = time.time()
+    df = source.get("active")
+    if df is None or df.empty:
+        return _err("No data available in this source.")
+
+    summary = _df_summary(df)
+    system  = (
+        f"You are a data analyst working with a {source_type.upper()} dataset. "
+        "Answer the user's question directly and clearly based on the data provided. "
+        "Perform any needed calculations mentally. "
+        "Return a human-readable answer — numbers, lists, summaries — whatever fits best. "
+        "Do NOT output code or SQL."
+    )
+    user   = f"DATA:\n{summary}\n\nQUESTION: {question}"
+    answer = await llm_chat(system, user, max_tokens=2000)
+
+    return {
+        "success":        True,
+        "answer":         answer,
+        "source_type":    source_type,
+        "rows_used":      len(df),
+        "execution_time": round(time.time() - t0, 4),
+        "metadata":       {"columns": df.columns.tolist(), "total_rows": len(df)},
+    }
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  DATABASE AGENT  —  PostgreSQL / MySQL / SQLite / BigQuery
+#  The LLM generates SQL internally, we execute it, then LLM narrates result.
+#  The user NEVER sees the SQL.
+# ═════════════════════════════════════════════════════════════════════════════
+
+_SQL_BANNED = re.compile(
+    r"\b(drop|delete|truncate|insert|update|alter|create|replace|"
+    r"exec|execute|xp_|sp_|attach|detach)\b", re.IGNORECASE)
+
+def _guard_sql(sql: str):
+    if _SQL_BANNED.search(sql):
+        raise HTTPException(400, "Generated query contains disallowed operations.")
+    if sql.count(";") > 1:
+        raise HTTPException(400, "Multiple statements not allowed.")
+
+async def _generate_internal_sql(schema_text: str, question: str,
+                                  dialect: str) -> str:
+    """Ask LLM to produce SQL. This SQL is NEVER returned to the frontend."""
+    system = (
+        f"You are an expert {dialect} SQL generator. "
+        "Given the database schema below, write a single valid SELECT statement "
+        "that answers the user's question. "
+        "Output ONLY the SQL — no markdown, no explanation, no trailing semicolon.\n\n"
+        f"SCHEMA:\n{schema_text}"
+    )
+    sql = await llm_chat(system, question, max_tokens=512)
+    sql = re.sub(r"```sql|```", "", sql, flags=re.IGNORECASE).strip().rstrip(";")
+    return sql
+
+async def _narrate_result(question: str, df: pd.DataFrame,
+                           source_type: str) -> str:
+    """Ask LLM to produce a human answer from the raw query result."""
+    if df.empty:
+        return "No matching records found."
+    sample = df.head(50).fillna("").to_csv(index=False)
+    system = (
+        "You are a helpful data analyst. "
+        "Given the question and the query result below, "
+        "write a clear, concise, human-readable answer. "
+        "Include relevant numbers and key insights. "
+        "Do NOT mention SQL, databases, or technical details."
+    )
+    user = f"QUESTION: {question}\n\nQUERY RESULT ({len(df)} rows):\n{sample}"
+    return await llm_chat(system, user, max_tokens=800)
+
+def _schema_to_text(schema: Dict[str, List[dict]]) -> str:
+    lines = []
+    for table, cols in schema.items():
+        lines.append(f"Table: {table}")
+        for c in cols:
+            lines.append(f"  {c.get('column','?')} ({c.get('dtype','?')})")
+    return "\n".join(lines)
+
+async def answer_postgres(source: dict, question: str) -> dict:
+    if not _PG:
+        return _err("psycopg2 not installed.")
+    t0  = time.time()
+    cfg = source["config"]; pwd = source["_password"]
+    schema_text = _schema_to_text(source.get("schema", {}))
+    sql = await _generate_internal_sql(schema_text, question, "PostgreSQL")
+    _guard_sql(sql)
+    try:
+        conn = psycopg2.connect(
+            host=cfg["host"], port=cfg["port"], dbname=cfg["database"],
+            user=cfg["username"], password=pwd)
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(f"SET statement_timeout={QUERY_TIMEOUT*1000}")
+            cur.execute(sql)
+            rows = cur.fetchmany(1000)
+        conn.close()
+        df = pd.DataFrame(rows)
+    except Exception as e:
+        return _err(f"Database error: {e}")
+
+    answer = await _narrate_result(question, df, "postgres")
+    return _ok(answer, "postgres", df, time.time() - t0)
+
+async def answer_mysql(source: dict, question: str) -> dict:
+    if not _MY:
+        return _err("pymysql not installed.")
+    t0  = time.time()
+    cfg = source["config"]; pwd = source["_password"]
+    schema_text = _schema_to_text(source.get("schema", {}))
+    sql = await _generate_internal_sql(schema_text, question, "MySQL")
+    _guard_sql(sql)
+    try:
+        conn = pymysql.connect(
+            host=cfg["host"], port=cfg["port"], db=cfg["database"],
+            user=cfg["username"], password=pwd,
+            charset="utf8mb4", cursorclass=pymysql.cursors.DictCursor)
+        with conn.cursor() as cur:
+            cur.execute(sql)
+            rows = cur.fetchmany(1000)
+        conn.close()
+        df = pd.DataFrame(rows)
+    except Exception as e:
+        return _err(f"Database error: {e}")
+
+    answer = await _narrate_result(question, df, "mysql")
+    return _ok(answer, "mysql", df, time.time() - t0)
+
+async def answer_sqlite(source: dict, question: str) -> dict:
+    t0 = time.time()
+    db_path     = source.get("db_path")
+    schema_text = _schema_to_text(source.get("schema", {}))
+    sql = await _generate_internal_sql(schema_text, question, "SQLite")
+    _guard_sql(sql)
+    try:
+        con = sqlite3.connect(db_path)
+        df  = pd.read_sql_query(sql, con)
+        con.close()
+    except Exception as e:
+        return _err(f"SQLite error: {e}")
+
+    answer = await _narrate_result(question, df, "sqlite")
+    return _ok(answer, "sqlite", df, time.time() - t0)
+
+async def answer_bigquery(source: dict, question: str) -> dict:
+    if not _BQ:
+        return _err("google-cloud-bigquery not installed.")
+    t0  = time.time()
+    cfg = source["config"]
+    schema_text = _schema_to_text(source.get("schema", {}))
+    sql = await _generate_internal_sql(schema_text, question, "BigQuery Standard SQL")
+    _guard_sql(sql)
+    try:
+        creds_json = source.get("_credentials")
+        if creds_json:
+            from google.oauth2 import service_account
+            info  = json.loads(creds_json)
+            creds = service_account.Credentials.from_service_account_info(info)
+            client = _bq.Client(project=cfg["project_id"], credentials=creds)
+        else:
+            client = _bq.Client(project=cfg["project_id"])
+        df = client.query(sql).result(timeout=QUERY_TIMEOUT).to_dataframe()
+    except Exception as e:
+        return _err(f"BigQuery error: {e}")
+
+    answer = await _narrate_result(question, df, "bigquery")
+    return _ok(answer, "bigquery", df, time.time() - t0)
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  MONGODB AGENT
+# ═════════════════════════════════════════════════════════════════════════════
+
+async def _generate_mongo_pipeline(schema_fields: List[str], question: str) -> list:
+    """Ask LLM to produce a MongoDB aggregation pipeline (never shown to user)."""
+    fields_text = ", ".join(schema_fields)
+    system = (
+        "You are a MongoDB expert. Given the collection fields below, "
+        "produce a MongoDB aggregation pipeline as a JSON array that answers "
+        "the user's question. Output ONLY the JSON array — no markdown, "
+        "no explanation.\n\n"
+        f"FIELDS: {fields_text}"
+    )
+    raw = await llm_chat(system, question, max_tokens=600)
+    raw = re.sub(r"```json|```", "", raw, flags=re.IGNORECASE).strip()
+    try:
+        return json.loads(raw)
+    except Exception:
+        return [{"$limit": 20}]   # safe fallback
+
+async def answer_mongodb(source: dict, question: str) -> dict:
+    if not _MONGO:
+        return _err("pymongo not installed.")
+    t0  = time.time()
+    cfg = source["config"]
+    col_name    = cfg.get("collection", "")
+    all_fields  = []
+    for fields in source.get("schema", {}).values():
+        all_fields.extend(fields if isinstance(fields[0], str) else [f["column"] for f in fields])
+
+    pipeline = await _generate_mongo_pipeline(all_fields, question)
+    try:
+        client = pymongo.MongoClient(cfg["uri"])
+        cursor = client[cfg["database"]][col_name].aggregate(pipeline)
+        docs   = list(cursor)
+        client.close()
+        for d in docs:
+            d.pop("_id", None)
+        df = pd.DataFrame(docs) if docs else pd.DataFrame()
+    except Exception as e:
+        return _err(f"MongoDB error: {e}")
+
+    answer = await _narrate_result(question, df, "mongodb")
+    return _ok(answer, "mongodb", df, time.time() - t0)
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  REST API AGENT
+# ═════════════════════════════════════════════════════════════════════════════
+
+async def answer_api(source: dict, question: str) -> dict:
+    t0  = time.time()
+    cfg = source["config"]
+    try:
+        async with httpx.AsyncClient(timeout=QUERY_TIMEOUT) as c:
+            resp = await c.request(cfg.get("method","GET"), cfg["url"],
+                                   headers=cfg.get("headers",{}),
+                                   params=cfg.get("params",{}))
+        resp.raise_for_status()
+        raw = resp.json()
+    except Exception as e:
+        return _err(f"API fetch failed: {e}")
+
+    df = _json_to_df(raw)
+    source["active"] = df   # cache refreshed data
+    return await answer_dataframe(source, question, "api")
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  UNIVERSAL QUERY ROUTER  —  the single entry point
+# ═════════════════════════════════════════════════════════════════════════════
+
+async def answer_question(source_id: str, question: str, limit: int = 1000) -> dict:
+    """
+    Route the question to the correct AI strategy based on source type.
+    Returns a unified response dict — caller never sees SQL / pipelines.
+    """
+    if source_id not in SOURCES:
+        return _err("Source not found.")
+
+    source = SOURCES[source_id]
+    stype  = source["type"]
+    log.info("Routing question to [%s] source: %s", stype, question[:80])
+
+    if stype == "pdf":
+        return await answer_pdf(source, question)
+    elif stype in ("excel", "csv"):
+        return await answer_dataframe(source, question, stype)
+    elif stype == "postgres":
+        return await answer_postgres(source, question)
+    elif stype == "mysql":
+        return await answer_mysql(source, question)
+    elif stype == "sqlite":
+        return await answer_sqlite(source, question)
+    elif stype == "bigquery":
+        return await answer_bigquery(source, question)
+    elif stype == "mongodb":
+        return await answer_mongodb(source, question)
+    elif stype == "api":
+        return await answer_api(source, question)
+    else:
+        return _err(f"Unsupported source type: {stype}")
+
+# ─── Result helpers ───────────────────────────────────────────────────────────
+
+def _ok(answer: str, stype: str, df: pd.DataFrame, elapsed: float,
+        extra_meta: dict | None = None) -> dict:
+    meta = {"total_rows": len(df), "columns": df.columns.tolist()}
+    if extra_meta:
+        meta.update(extra_meta)
+    return {
+        "success":        True,
+        "answer":         answer,
+        "source_type":    stype,
+        "rows_used":      len(df),
+        "execution_time": round(elapsed, 4),
+        "metadata":       meta,
+        # also expose rows/columns so the frontend table still works
+        "columns":        df.columns.tolist(),
+        "rows":           df.head(1000).fillna("").to_dict(orient="records"),
+        "row_count":      len(df),
+    }
+
+def _err(msg: str) -> dict:
+    return {"success": False, "answer": msg, "source_type": "unknown",
+            "rows_used": 0, "execution_time": 0, "metadata": {},
+            "columns": [], "rows": [], "row_count": 0}
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  FILE PROCESSING
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _pandas_dtype(dtype) -> str:
     n = str(dtype)
     if "int"      in n: return "integer"
     if "float"    in n: return "float"
@@ -221,1076 +586,490 @@ def pandas_dtype_label(dtype) -> str:
     if "bool"     in n: return "boolean"
     return "text"
 
-def safe_source(source_id: str) -> dict:
-    if source_id not in SOURCES:
-        raise HTTPException(404, f"Source '{source_id}' not found.")
-    return SOURCES[source_id]
+def _df_schema(df: pd.DataFrame, table: str = "df") -> List[dict]:
+    return [{"column": c, "dtype": _pandas_dtype(df[c].dtype),
+             "nullable": bool(df[c].isnull().any())} for c in df.columns]
 
-def push_history(entry: dict):
-    HISTORY.insert(0, entry)
-    if len(HISTORY) > MAX_HIST:
-        HISTORY.pop()
+def _json_to_df(data: Any) -> pd.DataFrame:
+    if isinstance(data, list):
+        return pd.DataFrame([_flatten(r) for r in data])
+    if isinstance(data, dict):
+        for k in ("data","results","items","records","rows"):
+            if isinstance(data.get(k), list):
+                return _json_to_df(data[k])
+        return pd.DataFrame([_flatten(data)])
+    return pd.DataFrame()
 
-def df_to_response(df: pd.DataFrame, t0: float) -> dict:
-    df = df.fillna("")
-    return {
-        "success":        True,
-        "columns":        df.columns.tolist(),
-        "rows":           df.to_dict(orient="records"),
-        "row_count":      len(df),
-        "execution_time": round(time.time() - t0, 4),
-    }
-
-# ── SQL injection guard ───────────────────────────────────────────────────────
-_BANNED_SQL = re.compile(
-    r"\b(drop|delete|truncate|insert|update|alter|create|replace|"
-    r"exec|execute|xp_|sp_|attach|detach|pragma\s+(?!table_info|foreign_key))\b",
-    re.IGNORECASE,
-)
-
-def assert_safe_sql(sql: str):
-    if _BANNED_SQL.search(sql):
-        raise HTTPException(400, "Query contains disallowed SQL keywords.")
-    if ";" in sql:
-        raise HTTPException(400, "Multiple statements (;) are not allowed.")
-
-# ─── flatten nested JSON to dataframe rows ───────────────────────────────────
-def flatten_json(obj: Any, prefix: str = "") -> Dict[str, Any]:
+def _flatten(obj: Any, prefix: str = "") -> Dict[str, Any]:
     out: Dict[str, Any] = {}
     if isinstance(obj, dict):
         for k, v in obj.items():
             full = f"{prefix}.{k}" if prefix else k
-            out.update(flatten_json(v, full))
+            out.update(_flatten(v, full))
     elif isinstance(obj, list):
         out[prefix] = json.dumps(obj)
     else:
         out[prefix] = obj
     return out
 
-def json_to_df(data: Any) -> pd.DataFrame:
-    if isinstance(data, list):
-        rows = [flatten_json(r) for r in data]
-        return pd.DataFrame(rows)
-    if isinstance(data, dict):
-        # try common envelope keys
-        for key in ("data", "results", "items", "records", "rows"):
-            if isinstance(data.get(key), list):
-                return json_to_df(data[key])
-        return pd.DataFrame([flatten_json(data)])
-    return pd.DataFrame()
-
-# ── describe a dataframe schema ───────────────────────────────────────────────
-def df_schema(df: pd.DataFrame, table_name: str = "df") -> List[dict]:
-    return [
-        {
-            "table":    table_name,
-            "column":   col,
-            "dtype":    pandas_dtype_label(df[col].dtype),
-            "nullable": bool(df[col].isnull().any()),
-            "sample":   str(df[col].dropna().iloc[0]) if not df[col].dropna().empty else None,
-        }
-        for col in df.columns
-    ]
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  AI / LLM ABSTRACTION LAYER
-#
-#  Drop-in any LLM: set OPENAI_API_KEY for OpenAI, or swap call_llm()
-#  with your provider.  The rest of the code stays the same.
-# ══════════════════════════════════════════════════════════════════════════════
-
-import os
-load_dotenv()
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-OPENAI_MODEL   = os.getenv("OPENAI_MODEL",   "gpt-4o-mini")
-LLM_PROVIDER   = os.getenv("LLM_PROVIDER",   "openai")   # openai | anthropic | stub
-
-def _schema_text(source: dict) -> str:
-    """Convert source schema to a compact text description for the prompt."""
-    src_type = source["type"]
-    lines    = [f"Source type: {src_type}"]
-
-    if src_type in ("excel", "csv", "sqlite", "pdf"):
-        for tbl, cols in source.get("schema", {}).items():
-            lines.append(f"\nTable: {tbl}")
-            for c in cols:
-                lines.append(f"  - {c['column']} ({c['dtype']})")
-
-    elif src_type in ("postgres", "mysql"):
-        for tbl, cols in source.get("schema", {}).items():
-            lines.append(f"\nTable: {tbl}")
-            for c in cols:
-                lines.append(f"  - {c['column']} {c['dtype']}")
-
-    elif src_type == "mongodb":
-        for col_name, fields in source.get("schema", {}).items():
-            lines.append(f"\nCollection: {col_name}")
-            for f in fields:
-                lines.append(f"  - {f}")
-
-    elif src_type == "api":
-        for col in source.get("columns", []):
-            lines.append(f"  - {col}")
-
-    return "\n".join(lines)
-
-def _build_system_prompt(source: dict) -> str:
-    src_type  = source["type"]
-    schema_tx = _schema_text(source)
-
-    if src_type in ("postgres", "mysql", "sqlite"):
-        dialect = {"postgres": "PostgreSQL", "mysql": "MySQL", "sqlite": "SQLite"}[src_type]
-        return (
-            f"You are a {dialect} SQL expert. "
-            "Convert the user's natural-language request into a single valid SELECT statement. "
-            "Output ONLY the SQL — no markdown, no explanation, no semicolons.\n\n"
-            f"Schema:\n{schema_tx}"
-        )
-    if src_type in ("excel", "csv"):
-        return (
-            "You convert natural language to SQL for pandasql (SQLite dialect). "
-            "The table name is always `df`. "
-            "Output ONLY the SQL SELECT — no markdown, no explanation, no semicolons.\n\n"
-            f"Schema:\n{schema_tx}"
-        )
-    if src_type == "mongodb":
-        return (
-            "You convert natural language to a MongoDB query in JSON format. "
-            "Output ONLY valid JSON with keys 'filter' and optionally 'projection', "
-            "'sort', 'limit'. No explanation.\n\n"
-            f"Schema:\n{schema_tx}"
-        )
-    if src_type == "bigquery":
-        return (
-            "You are a BigQuery (Standard SQL) expert. "
-            "Convert the user request to a valid SELECT. "
-            "Output ONLY the SQL.\n\n"
-            f"Schema:\n{schema_tx}"
-        )
-    # api / pdf / generic
-    return (
-        "Convert the user's request into a filter description or SQL for pandasql. "
-        "Table name is `df`. Output ONLY the query.\n\n"
-        f"Schema:\n{schema_tx}"
-    )
-
-async def call_llm(system_prompt: str, user_prompt: str) -> str:
-    """
-    Pluggable LLM call.  Currently supports:
-      - openai   (set OPENAI_API_KEY)
-      - anthropic (set ANTHROPIC_API_KEY)
-      - stub      (returns a canned response for local testing)
-    """
-    if LLM_PROVIDER == "stub" or not OPENAI_API_KEY:
-        log.warning("LLM_PROVIDER=stub — returning placeholder query.")
-        return "SELECT * FROM df LIMIT 10"
-
-    if LLM_PROVIDER == "anthropic":
-        anthropic_key = os.getenv("ANTHROPIC_API_KEY", "")
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.post(
-                "https://api.anthropic.com/v1/messages",
-                headers={
-                    "x-api-key": anthropic_key,
-                    "anthropic-version": "2023-06-01",
-                    "content-type": "application/json",
-                },
-                json={
-                    "model": os.getenv("ANTHROPIC_MODEL", "claude-3-haiku-20240307"),
-                    "max_tokens": 512,
-                    "system": system_prompt,
-                    "messages": [{"role": "user", "content": user_prompt}],
-                },
-            )
-        resp.raise_for_status()
-        return resp.json()["content"][0]["text"].strip()
-
-    # default: openai
-    async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.post(
-            "https://api.openai.com/v1/chat/completions",
-            headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
-            json={
-                "model": OPENAI_MODEL,
-                "temperature": 0,
-                "max_tokens": 512,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user",   "content": user_prompt},
-                ],
-            },
-        )
-    resp.raise_for_status()
-    return resp.json()["choices"][0]["message"]["content"].strip()
-
-def extract_sql_from_llm(text: str) -> str:
-    """Strip markdown fences and normalise the SQL returned by the LLM."""
-    text = re.sub(r"```(?:sql|SQL)?\n?", "", text).replace("```", "").strip()
-    m = re.search(r"(?si)\bselect\b", text)
-    if m:
-        candidate = text[m.start():]
-        candidate = re.split(r"\n\s*\n", candidate)[0].strip().rstrip(";")
-        return candidate
-    return text.rstrip(";")
-
-async def generate_query_from_nl(source: dict, prompt: str) -> str:
-    """
-    Main AI entrypoint.  Builds a dynamic prompt from the source schema,
-    calls the configured LLM, and returns the generated query string.
-    """
-    system  = _build_system_prompt(source)
-    raw     = await call_llm(system, prompt)
-    src_type = source["type"]
-    if src_type in ("postgres", "mysql", "sqlite", "excel", "csv", "bigquery"):
-        return extract_sql_from_llm(raw)
-    return raw   # mongodb JSON / generic — return as-is
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  FILE PROCESSING
-# ══════════════════════════════════════════════════════════════════════════════
-
-# ── Excel ─────────────────────────────────────────────────────────────────────
-def process_excel(content: bytes, filename: str) -> dict:
-    xls    = pd.read_excel(io.BytesIO(content), sheet_name=None)
-    frames = {}
-    schema = {}
-    for sheet, df in xls.items():
-        df           = df.copy()
-        df["_sheet"] = sheet
-        frames[sheet] = df
-        schema[sheet] = df_schema(df, sheet)
-    all_df = pd.concat(list(frames.values()), ignore_index=True, sort=False)
-    return {
-        "frames":   frames,
-        "active":   all_df,
-        "schema":   schema,
-        "sheets":   list(xls.keys()),
-        "filename": filename,
-    }
-
-# ── CSV ───────────────────────────────────────────────────────────────────────
-def process_csv(content: bytes, filename: str) -> dict:
-    df             = pd.read_csv(io.BytesIO(content))
-    df["_sheet"]   = "Sheet1"
-    return {
-        "frames":   {"Sheet1": df},
-        "active":   df,
-        "schema":   {"Sheet1": df_schema(df, "Sheet1")},
-        "sheets":   ["Sheet1"],
-        "filename": filename,
-    }
-
-# ── SQLite ────────────────────────────────────────────────────────────────────
-def process_sqlite(content: bytes, filename: str) -> dict:
-    # write to a tmp in-memory bytes so sqlite3 can open it
-    tmp_path = f"/tmp/dq_{uuid.uuid4().hex}.db"
-    with open(tmp_path, "wb") as f:
-        f.write(content)
-    con    = sqlite3.connect(tmp_path)
-    tables = [r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
-    frames = {}
-    schema = {}
-    for tbl in tables:
-        df           = pd.read_sql_query(f"SELECT * FROM \"{tbl}\"", con)
-        frames[tbl]  = df
-        schema[tbl]  = df_schema(df, tbl)
-    con.close()
-    return {
-        "frames":   frames,
-        "active":   frames[tables[0]] if tables else pd.DataFrame(),
-        "schema":   schema,
-        "tables":   tables,
-        "db_path":  tmp_path,
-        "filename": filename,
-    }
-
 # ── PDF ───────────────────────────────────────────────────────────────────────
-def process_pdf(content: bytes, filename: str) -> dict:
-    if not _PDF_OK:
-        raise HTTPException(500, "pdfplumber not installed. Run: pip install pdfplumber")
 
-    pages_text  = []
-    all_tables  = []
+def process_pdf(content: bytes, filename: str) -> dict:
+    if not _PDF:
+        raise HTTPException(500, "pdfplumber not installed: pip install pdfplumber")
+
+    pages_text = []
+    all_tables = []
+    full_text_parts = []
+
     with pdfplumber.open(io.BytesIO(content)) as pdf:
         for i, page in enumerate(pdf.pages, 1):
-            pages_text.append({"page": i, "text": page.extract_text() or ""})
+            text = page.extract_text() or ""
+            pages_text.append({"page": i, "text": text})
+            full_text_parts.append(f"[Page {i}]\n{text}")
+
             for tbl in (page.extract_tables() or []):
                 if not tbl: continue
                 headers = [str(h or f"col_{j}") for j, h in enumerate(tbl[0])]
-                rows    = [dict(zip(headers, [str(c or "") for c in row])) for row in tbl[1:]]
+                rows    = [dict(zip(headers, [str(c or "") for c in row]))
+                           for row in tbl[1:]]
                 all_tables.append({"page": i, "headers": headers, "rows": rows})
 
-    # build a combined dataframe for querying
+    full_text = "\n\n".join(full_text_parts)
+
+    # Build a flat dataframe for any table-based preview
     if all_tables:
         df = pd.DataFrame(all_tables[0]["rows"])
     else:
         df = pd.DataFrame(pages_text)
 
     return {
-        "pages":    pages_text,
-        "tables":   all_tables,
-        "active":   df,
-        "schema":   {"pdf": df_schema(df, "pdf")},
-        "filename": filename,
+        "full_text":  full_text,
+        "pages":      pages_text,
+        "tables":     all_tables,
+        "active":     df,
+        "schema":     {"pdf": _df_schema(df, "pdf")},
+        "chunks":     [],       # will be built lazily on first question
+        "embeddings": [],
+        "filename":   filename,
     }
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  DATABASE CONNECTORS
-# ══════════════════════════════════════════════════════════════════════════════
+# ── Excel / CSV ───────────────────────────────────────────────────────────────
 
-# ── PostgreSQL ────────────────────────────────────────────────────────────────
-def pg_connect(cfg: PostgresConnect):
-    if not _PG_OK:
-        raise HTTPException(500, "psycopg2 not installed.")
-    conn = psycopg2.connect(
-        host=cfg.host, port=cfg.port, dbname=cfg.database,
-        user=cfg.username, password=cfg.password,
-        connect_timeout=10,
-        sslmode="require" if cfg.ssl else "prefer",
-    )
-    return conn
+def process_excel(content: bytes, filename: str) -> dict:
+    xls    = pd.read_excel(io.BytesIO(content), sheet_name=None)
+    frames, schema = {}, {}
+    for name, df in xls.items():
+        df = df.copy(); df["_sheet"] = name
+        frames[name] = df
+        schema[name] = _df_schema(df, name)
+    combined = pd.concat(list(frames.values()), ignore_index=True, sort=False)
+    return {"frames": frames, "active": combined, "schema": schema,
+            "sheets": list(xls.keys()), "filename": filename}
 
-def pg_list_tables(conn) -> List[str]:
+def process_csv(content: bytes, filename: str) -> dict:
+    df = pd.read_csv(io.BytesIO(content))
+    df["_sheet"] = "Sheet1"
+    return {"frames": {"Sheet1": df}, "active": df,
+            "schema": {"Sheet1": _df_schema(df, "Sheet1")},
+            "sheets": ["Sheet1"], "filename": filename}
+
+# ── SQLite ────────────────────────────────────────────────────────────────────
+
+def process_sqlite(content: bytes, filename: str) -> dict:
+    tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+    tmp.write(content); tmp.close()
+    con    = sqlite3.connect(tmp.name)
+    tables = [r[0] for r in con.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
+    frames, schema = {}, {}
+    for tbl in tables:
+        df = pd.read_sql_query(f'SELECT * FROM "{tbl}"', con)
+        frames[tbl] = df; schema[tbl] = _df_schema(df, tbl)
+    con.close()
+    combined = pd.concat(list(frames.values()), ignore_index=True, sort=False) if frames else pd.DataFrame()
+    return {"frames": frames, "active": combined, "schema": schema,
+            "tables": tables, "db_path": tmp.name, "filename": filename}
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  DB SCHEMA HELPERS
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _pg_schema(conn) -> Dict[str, List[dict]]:
+    tables = [r[0] for r in conn.cursor().execute(
+        "SELECT table_name FROM information_schema.tables WHERE table_schema='public'"
+    ).fetchall()] if False else []   # psycopg2 uses different cursor
     with conn.cursor() as cur:
-        cur.execute(
-            "SELECT table_name FROM information_schema.tables "
-            "WHERE table_schema = 'public' ORDER BY table_name"
-        )
-        return [r[0] for r in cur.fetchall()]
+        cur.execute("SELECT table_name FROM information_schema.tables "
+                    "WHERE table_schema='public' ORDER BY table_name")
+        tables = [r[0] for r in cur.fetchall()]
+    schema = {}
+    for tbl in tables:
+        with conn.cursor() as cur:
+            cur.execute("SELECT column_name, data_type FROM information_schema.columns "
+                        "WHERE table_name=%s ORDER BY ordinal_position", (tbl,))
+            schema[tbl] = [{"column": r[0], "dtype": r[1]} for r in cur.fetchall()]
+    return schema
 
-def pg_table_schema(conn, table: str) -> List[dict]:
-    with conn.cursor() as cur:
-        cur.execute(
-            "SELECT column_name, data_type FROM information_schema.columns "
-            "WHERE table_name = %s ORDER BY ordinal_position",
-            (table,),
-        )
-        return [{"column": r[0], "dtype": r[1]} for r in cur.fetchall()]
-
-def pg_run_sql(conn, sql: str, limit: int = 1000) -> pd.DataFrame:
-    assert_safe_sql(sql)
-    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-        cur.execute(f"SET statement_timeout = {QUERY_TIMEOUT * 1000}")
-        cur.execute(sql)
-        rows = cur.fetchmany(limit)
-    return pd.DataFrame(rows)
-
-# ── MySQL ─────────────────────────────────────────────────────────────────────
-def my_connect(cfg: MySQLConnect):
-    if not _MYSQL_OK:
-        raise HTTPException(500, "pymysql not installed.")
-    conn = pymysql.connect(
-        host=cfg.host, port=cfg.port, db=cfg.database,
-        user=cfg.username, password=cfg.password,
-        charset="utf8mb4", cursorclass=pymysql.cursors.DictCursor,
-        connect_timeout=10,
-    )
-    return conn
-
-def my_list_tables(conn) -> List[str]:
+def _my_schema(conn) -> Dict[str, List[dict]]:
     with conn.cursor() as cur:
         cur.execute("SHOW TABLES")
-        return [list(r.values())[0] for r in cur.fetchall()]
+        tables = [list(r.values())[0] for r in cur.fetchall()]
+    schema = {}
+    for tbl in tables:
+        with conn.cursor() as cur:
+            cur.execute(f"DESCRIBE `{tbl}`")
+            schema[tbl] = [{"column": r["Field"], "dtype": r["Type"]}
+                           for r in cur.fetchall()]
+    return schema
 
-def my_table_schema(conn, table: str) -> List[dict]:
-    with conn.cursor() as cur:
-        cur.execute(f"DESCRIBE `{table}`")
-        return [{"column": r["Field"], "dtype": r["Type"]} for r in cur.fetchall()]
+# ═════════════════════════════════════════════════════════════════════════════
+#  EXPORT
+# ═════════════════════════════════════════════════════════════════════════════
 
-def my_run_sql(conn, sql: str, limit: int = 1000) -> pd.DataFrame:
-    assert_safe_sql(sql)
-    with conn.cursor() as cur:
-        cur.execute(f"SET SESSION MAX_EXECUTION_TIME={QUERY_TIMEOUT * 1000}")
-        cur.execute(sql)
-        rows = cur.fetchmany(limit)
-    return pd.DataFrame(rows)
+def _rows_to_df(rows, cols): return pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame(columns=cols)
 
-# ── MongoDB ───────────────────────────────────────────────────────────────────
-def mongo_connect(cfg: MongoConnect):
-    if not _MONGO_OK:
-        raise HTTPException(500, "pymongo not installed.")
-    client = pymongo.MongoClient(cfg.uri, serverSelectionTimeoutMS=10_000)
-    client.admin.command("ping")
-    return client
-
-def mongo_list_collections(client, database: str) -> List[str]:
-    return client[database].list_collection_names()
-
-def mongo_collection_sample_schema(client, database: str, collection: str) -> List[str]:
-    sample = client[database][collection].find_one()
-    if not sample:
-        return []
-    sample.pop("_id", None)
-    return list(flatten_json(sample).keys())
-
-def mongo_run_query(client, database: str, collection: str, query_json: str, limit: int = 1000) -> pd.DataFrame:
-    try:
-        q = json.loads(query_json)
-    except json.JSONDecodeError:
-        q = {}
-    filt       = q.get("filter", q) if isinstance(q, dict) else {}
-    projection = q.get("projection", None)
-    sort       = q.get("sort", None)
-    limit_val  = min(q.get("limit", limit), limit)
-    cursor     = client[database][collection].find(filt, projection)
-    if sort:
-        cursor = cursor.sort(list(sort.items()))
-    docs = list(cursor.limit(limit_val))
-    for d in docs:
-        d.pop("_id", None)
-    return pd.DataFrame([flatten_json(d) for d in docs])
-
-# ── BigQuery ──────────────────────────────────────────────────────────────────
-def bq_run_sql(project_id: str, sql: str, credentials_json: Optional[str] = None) -> pd.DataFrame:
-    if not _BQ_OK:
-        raise HTTPException(500, "google-cloud-bigquery not installed.")
-    assert_safe_sql(sql)
-    if credentials_json:
-        import json as _json
-        from google.oauth2 import service_account
-        info   = _json.loads(credentials_json)
-        creds  = service_account.Credentials.from_service_account_info(info)
-        client = bq.Client(project=project_id, credentials=creds)
-    else:
-        client = bq.Client(project=project_id)
-    job    = client.query(sql)
-    result = job.result(timeout=QUERY_TIMEOUT)
-    return result.to_dataframe()
-
-# ── REST API ──────────────────────────────────────────────────────────────────
-async def api_fetch(cfg_dict: dict) -> pd.DataFrame:
-    url     = cfg_dict["url"]
-    method  = cfg_dict.get("method", "GET").upper()
-    headers = cfg_dict.get("headers", {})
-    params  = cfg_dict.get("params", {})
-    body    = cfg_dict.get("body")
-    async with httpx.AsyncClient(timeout=QUERY_TIMEOUT) as client:
-        resp = await client.request(method, url, headers=headers, params=params,
-                                    content=body.encode() if body else None)
-    resp.raise_for_status()
-    return json_to_df(resp.json())
-
-# ── pandasql helper (for excel/csv/sqlite/pdf/api) ────────────────────────────
-from pandasql import sqldf as _pdsql
-
-def run_pandasql(df: pd.DataFrame, sql: str) -> pd.DataFrame:
-    assert_safe_sql(sql)
-    env = {"df": df}
-    try:
-        return _pdsql(sql, env)
-    except Exception as e:
-        raise HTTPException(400, f"Query execution failed: {e}")
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  EXPORT HELPERS
-# ══════════════════════════════════════════════════════════════════════════════
-
-def rows_to_df(rows: List[dict], columns: List[str]) -> pd.DataFrame:
-    return pd.DataFrame(rows, columns=columns) if rows else pd.DataFrame(columns=columns)
-
-def make_xlsx(df: pd.DataFrame) -> bytes:
+def _make_xlsx(df):
     buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as w:
-        df.to_excel(w, index=False, sheet_name="Results")
+    with pd.ExcelWriter(buf, engine="openpyxl") as w: df.to_excel(w, index=False)
     return buf.getvalue()
 
-def make_csv(df: pd.DataFrame) -> bytes:
-    return df.to_csv(index=False).encode("utf-8")
+def _make_csv(df):  return df.to_csv(index=False).encode("utf-8")
+def _make_json(df): return json.dumps(df.to_dict(orient="records"), default=str, indent=2).encode()
 
-def make_json_bytes(df: pd.DataFrame) -> bytes:
-    return json.dumps(df.to_dict(orient="records"), default=str, indent=2).encode("utf-8")
-
-def make_pdf(df: pd.DataFrame) -> bytes:
+def _make_pdf_file(df):
     buf = io.BytesIO()
     doc = SimpleDocTemplate(buf, pagesize=landscape(A4),
                             leftMargin=18, rightMargin=18, topMargin=18, bottomMargin=18)
-    data = [df.columns.tolist()] + [
-        [str(v) if v is not None else "" for v in row]
-        for _, row in df.iterrows()
-    ]
-    pw  = landscape(A4)[0] - 36
-    cw  = [pw / max(1, len(df.columns))] * max(1, len(df.columns))
-    tbl = Table(data, colWidths=cw, repeatRows=1)
+    data = [df.columns.tolist()] + [[str(v or "") for v in row] for _, row in df.iterrows()]
+    pw   = landscape(A4)[0] - 36
+    cw   = [pw / max(1, len(df.columns))] * max(1, len(df.columns))
+    tbl  = Table(data, colWidths=cw, repeatRows=1)
     tbl.setStyle(TableStyle([
-        ("BACKGROUND",    (0, 0), (-1, 0),  colors.HexColor("#1e293b")),
-        ("TEXTCOLOR",     (0, 0), (-1, 0),  colors.HexColor("#f1f5f9")),
-        ("FONTNAME",      (0, 0), (-1, 0),  "Helvetica-Bold"),
-        ("FONTSIZE",      (0, 0), (-1, -1), 8),
-        ("ALIGN",         (0, 0), (-1, -1), "LEFT"),
-        ("GRID",          (0, 0), (-1, -1), 0.25, colors.HexColor("#334155")),
-        ("ROWBACKGROUNDS",(0, 1), (-1, -1),
-         [colors.HexColor("#0f172a"), colors.HexColor("#1e293b")]),
-        ("TEXTCOLOR",     (0, 1), (-1, -1), colors.HexColor("#cbd5e1")),
+        ("BACKGROUND",(0,0),(-1,0),colors.HexColor("#1e293b")),
+        ("TEXTCOLOR", (0,0),(-1,0),colors.HexColor("#f1f5f9")),
+        ("FONTNAME",  (0,0),(-1,0),"Helvetica-Bold"),
+        ("FONTSIZE",  (0,0),(-1,-1),8),
+        ("GRID",      (0,0),(-1,-1),.25,colors.HexColor("#334155")),
+        ("ROWBACKGROUNDS",(0,1),(-1,-1),[colors.HexColor("#0f172a"),colors.HexColor("#1e293b")]),
+        ("TEXTCOLOR", (0,1),(-1,-1),colors.HexColor("#cbd5e1")),
     ]))
-    doc.build([tbl])
-    return buf.getvalue()
+    doc.build([tbl]); return buf.getvalue()
 
-def streaming_file(data: bytes, media_type: str, filename: str) -> StreamingResponse:
-    return StreamingResponse(
-        io.BytesIO(data),
-        media_type=media_type,
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
-    )
+def _stream(data, mime, fname):
+    return StreamingResponse(io.BytesIO(data), media_type=mime,
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'})
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════
+#  HELPERS
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _now(): return datetime.utcnow().isoformat() + "Z"
+def _sid(): return str(uuid.uuid4())
+
+def _safe_src(sid):
+    if sid not in SOURCES:
+        raise HTTPException(404, f"Source '{sid}' not found.")
+    return SOURCES[sid]
+
+def _push_hist(entry):
+    HISTORY.insert(0, entry)
+    if len(HISTORY) > MAX_HIST: HISTORY.pop()
+
+# ═════════════════════════════════════════════════════════════════════════════
 #  ── ROUTES ──
-# ══════════════════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  HEALTH
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Health ────────────────────────────────────────────────────────────────────
 
 @app.get("/health", tags=["System"])
 def health():
     return {
-        "status":            "healthy",
-        "active_sources":    len(SOURCES),
-        "history_entries":   len(HISTORY),
-        "openai_configured": bool(OPENAI_API_KEY),
+        "status": "healthy",
+        "engine": "Universal AI Query Engine v3",
         "llm_provider":      LLM_PROVIDER,
-        "optional_deps": {
-            "pdfplumber": _PDF_OK,
-            "psycopg2":   _PG_OK,
-            "pymysql":    _MYSQL_OK,
-            "pymongo":    _MONGO_OK,
-            "bigquery":   _BQ_OK,
-        },
+        "openai_configured": bool(OPENAI_API_KEY),
+        "active_sources":    len(SOURCES),
+        "optional_deps":     {"pdfplumber":_PDF,"psycopg2":_PG,
+                               "pymysql":_MY,"pymongo":_MONGO,"bigquery":_BQ},
     }
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  DATA SOURCE — FILE UPLOADS
-# ─────────────────────────────────────────────────────────────────────────────
+# ── THE MAIN QUERY ENDPOINT ───────────────────────────────────────────────────
 
-@app.post("/sources/excel/upload", tags=["Sources"])
-async def upload_excel(
-    name: str        = Form(...),
-    file: UploadFile = File(...),
-):
-    """Upload an Excel (.xls / .xlsx) or CSV file."""
-    fn      = file.filename or ""
-    content = await file.read()
-
-    if fn.lower().endswith(".csv"):
-        data = process_csv(content, fn)
-    elif fn.lower().endswith((".xls", ".xlsx")):
-        data = process_excel(content, fn)
-    else:
-        raise HTTPException(400, "Only .xls, .xlsx, .csv files are accepted.")
-
-    sid = new_id()
-    SOURCES[sid] = {
-        "id":         sid,
-        "name":       name or fn,
-        "type":       "excel" if not fn.endswith(".csv") else "csv",
-        "filename":   fn,
-        "created_at": now_iso(),
-        "status":     "connected",
-        **data,
-    }
-    log.info("Excel/CSV source added: %s (%d rows)", sid, len(SOURCES[sid]["active"]))
-    return {
-        "source_id": sid,
-        "name":      SOURCES[sid]["name"],
-        "type":      SOURCES[sid]["type"],
-        "rows":      len(SOURCES[sid]["active"]),
-        "columns":   SOURCES[sid]["active"].columns.tolist(),
-        "sheets":    SOURCES[sid].get("sheets", ["Sheet1"]),
-        "schema":    SOURCES[sid]["schema"],
-    }
-
-
-@app.post("/sources/pdf/upload", tags=["Sources"])
-async def upload_pdf(
-    name: str        = Form(...),
-    file: UploadFile = File(...),
-):
-    """Upload and parse a PDF — extracts text + tables."""
-    fn      = file.filename or ""
-    if not fn.lower().endswith(".pdf"):
-        raise HTTPException(400, "Only .pdf files are accepted.")
-    content = await file.read()
-    data    = process_pdf(content, fn)
-    sid     = new_id()
-    SOURCES[sid] = {
-        "id":         sid,
-        "name":       name or fn,
-        "type":       "pdf",
-        "filename":   fn,
-        "created_at": now_iso(),
-        "status":     "connected",
-        **data,
-    }
-    log.info("PDF source added: %s (%d pages)", sid, len(data["pages"]))
-    return {
-        "source_id":   sid,
-        "name":        SOURCES[sid]["name"],
-        "type":        "pdf",
-        "page_count":  len(data["pages"]),
-        "table_count": len(data["tables"]),
-        "tables":      data["tables"],
-        "text_pages":  data["pages"],
-        "schema":      data["schema"],
-    }
-
-
-@app.post("/sources/sqlite/upload", tags=["Sources"])
-async def upload_sqlite(
-    name: str        = Form(...),
-    file: UploadFile = File(...),
-):
-    """Upload a SQLite database file."""
-    fn      = file.filename or ""
-    if not fn.lower().endswith((".db", ".sqlite", ".sqlite3")):
-        raise HTTPException(400, "Only .db / .sqlite / .sqlite3 files are accepted.")
-    content = await file.read()
-    data    = process_sqlite(content, fn)
-    sid     = new_id()
-    SOURCES[sid] = {
-        "id":         sid,
-        "name":       name or fn,
-        "type":       "sqlite",
-        "filename":   fn,
-        "created_at": now_iso(),
-        "status":     "connected",
-        **data,
-    }
-    log.info("SQLite source added: %s, tables: %s", sid, data["tables"])
-    return {
-        "source_id": sid,
-        "name":      SOURCES[sid]["name"],
-        "type":      "sqlite",
-        "tables":    data["tables"],
-        "schema":    data["schema"],
-    }
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  DATA SOURCE — DATABASE CONNECTIONS
-# ─────────────────────────────────────────────────────────────────────────────
-
-@app.post("/sources/postgres/connect", tags=["Sources"])
-async def connect_postgres(cfg: PostgresConnect):
-    """Connect to a PostgreSQL database."""
-    try:
-        conn   = pg_connect(cfg)
-        tables = pg_list_tables(conn)
-        schema = {t: pg_table_schema(conn, t) for t in tables}
-        conn.close()
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(400, f"PostgreSQL connection failed: {e}")
-
-    sid = new_id()
-    SOURCES[sid] = {
-        "id":         sid,
-        "name":       cfg.name,
-        "type":       "postgres",
-        "config":     cfg.dict(exclude={"password"}),
-        "_password":  cfg.password,  # kept for re-connection; never returned in API
-        "tables":     tables,
-        "schema":     schema,
-        "created_at": now_iso(),
-        "status":     "connected",
-    }
-    log.info("Postgres source added: %s, tables: %s", sid, tables)
-    return {"source_id": sid, "name": cfg.name, "type": "postgres",
-            "tables": tables, "schema": schema}
-
-
-@app.post("/sources/mysql/connect", tags=["Sources"])
-async def connect_mysql(cfg: MySQLConnect):
-    """Connect to a MySQL / MariaDB database."""
-    try:
-        conn   = my_connect(cfg)
-        tables = my_list_tables(conn)
-        schema = {t: my_table_schema(conn, t) for t in tables}
-        conn.close()
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(400, f"MySQL connection failed: {e}")
-
-    sid = new_id()
-    SOURCES[sid] = {
-        "id":         sid,
-        "name":       cfg.name,
-        "type":       "mysql",
-        "config":     cfg.dict(exclude={"password"}),
-        "_password":  cfg.password,
-        "tables":     tables,
-        "schema":     schema,
-        "created_at": now_iso(),
-        "status":     "connected",
-    }
-    return {"source_id": sid, "name": cfg.name, "type": "mysql",
-            "tables": tables, "schema": schema}
-
-
-@app.post("/sources/mongodb/connect", tags=["Sources"])
-async def connect_mongodb(cfg: MongoConnect):
-    """Connect to a MongoDB instance."""
-    try:
-        client      = mongo_connect(cfg)
-        collections = mongo_list_collections(client, cfg.database)
-        schema      = {
-            c: mongo_collection_sample_schema(client, cfg.database, c)
-            for c in collections
-        }
-        client.close()
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(400, f"MongoDB connection failed: {e}")
-
-    sid = new_id()
-    SOURCES[sid] = {
-        "id":         sid,
-        "name":       cfg.name,
-        "type":       "mongodb",
-        "config":     cfg.dict(),
-        "collections":collections,
-        "schema":     schema,
-        "created_at": now_iso(),
-        "status":     "connected",
-    }
-    return {"source_id": sid, "name": cfg.name, "type": "mongodb",
-            "collections": collections, "schema": schema}
-
-
-@app.post("/sources/api/connect", tags=["Sources"])
-async def connect_api(cfg: APIConnect):
-    """Fetch a REST API endpoint and register it as a queryable source."""
-    try:
-        df = await api_fetch(cfg.dict())
-    except Exception as e:
-        raise HTTPException(400, f"API fetch failed: {e}")
-
-    sid = new_id()
-    SOURCES[sid] = {
-        "id":         sid,
-        "name":       cfg.name,
-        "type":       "api",
-        "config":     cfg.dict(),
-        "active":     df,
-        "columns":    df.columns.tolist(),
-        "schema":     {"api": df_schema(df, "api")},
-        "created_at": now_iso(),
-        "status":     "connected",
-    }
-    return {"source_id": sid, "name": cfg.name, "type": "api",
-            "columns": df.columns.tolist(), "row_count": len(df),
-            "schema": SOURCES[sid]["schema"]}
-
-
-@app.post("/sources/bigquery/connect", tags=["Sources"])
-async def connect_bigquery(cfg: BigQueryConnect):
-    """Register a BigQuery project / dataset."""
-    if not _BQ_OK:
-        raise HTTPException(500, "google-cloud-bigquery not installed.")
-    # test the connection with a lightweight query
-    try:
-        test_sql = f"SELECT 1 FROM `{cfg.project_id}.{cfg.dataset_id}.__TABLES_SUMMARY__` LIMIT 1"
-        bq_run_sql(cfg.project_id, test_sql, cfg.credentials)
-    except Exception as e:
-        log.warning("BigQuery test query failed (may be fine): %s", e)
-
-    sid = new_id()
-    SOURCES[sid] = {
-        "id":          sid,
-        "name":        cfg.name,
-        "type":        "bigquery",
-        "config":      cfg.dict(exclude={"credentials"}),
-        "_credentials":cfg.credentials,
-        "created_at":  now_iso(),
-        "status":      "connected",
-        "schema":      {},
-    }
-    return {"source_id": sid, "name": cfg.name, "type": "bigquery",
-            "project_id": cfg.project_id, "dataset_id": cfg.dataset_id}
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  DATA SOURCE — CRUD
-# ─────────────────────────────────────────────────────────────────────────────
-
-@app.get("/sources", tags=["Sources"])
-def list_sources():
-    """List all registered data sources."""
-    return [
-        {
-            "id":         s["id"],
-            "name":       s["name"],
-            "type":       s["type"],
-            "status":     s["status"],
-            "created_at": s["created_at"],
-        }
-        for s in SOURCES.values()
-    ]
-
-
-@app.get("/sources/{source_id}", tags=["Sources"])
-def get_source(source_id: str):
-    """Get metadata for a single source."""
-    s = safe_source(source_id)
-    return {
-        "id":         s["id"],
-        "name":       s["name"],
-        "type":       s["type"],
-        "status":     s["status"],
-        "created_at": s["created_at"],
-        "schema":     s.get("schema", {}),
-        "tables":     s.get("tables") or s.get("collections") or s.get("sheets", []),
-    }
-
-
-@app.delete("/sources/{source_id}", tags=["Sources"])
-def delete_source(source_id: str):
-    """Remove a source and free its memory."""
-    safe_source(source_id)
-    # close live DB connections if present
-    conn = SOURCES[source_id].get("_conn")
-    if conn:
-        try: conn.close()
-        except Exception: pass
-    del SOURCES[source_id]
-    return {"deleted": source_id}
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  SCHEMA
-# ─────────────────────────────────────────────────────────────────────────────
-
-@app.get("/schema/{source_id}", tags=["Schema"])
-def get_schema(source_id: str):
-    """Return full schema for all tables / collections / sheets."""
-    s = safe_source(source_id)
-    return {"source_id": source_id, "type": s["type"], "schema": s.get("schema", {})}
-
-
-@app.get("/tables/{source_id}", tags=["Schema"])
-def get_tables(source_id: str):
-    """Return list of tables / collections / sheets."""
-    s = safe_source(source_id)
-    tables = (
-        s.get("tables")
-        or s.get("collections")
-        or s.get("sheets")
-        or list(s.get("schema", {}).keys())
-    )
-    return {"source_id": source_id, "type": s["type"], "tables": tables}
-
-
-@app.get("/columns/{source_id}/{table_name}", tags=["Schema"])
-def get_columns(source_id: str, table_name: str):
-    """Return column metadata for a specific table."""
-    s      = safe_source(source_id)
-    schema = s.get("schema", {})
-    if table_name not in schema:
-        raise HTTPException(404, f"Table '{table_name}' not found in schema.")
-    return {"source_id": source_id, "table": table_name, "columns": schema[table_name]}
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  QUERY ENGINE
-# ─────────────────────────────────────────────────────────────────────────────
-
-@app.post("/query/run", tags=["Query"])
-async def run_query(req: RunQueryRequest):
+@app.post("/query/ask", tags=["Query"])
+async def ask(req: AskRequest):
     """
-    Universal query endpoint.
-
-    `query_type`:
-    - **natural_language** → calls AI to generate a query then runs it
-    - **sql**              → runs raw SQL (pandasql for file sources, native for DBs)
-    - **mongodb**          → runs a JSON filter against a MongoDB collection
-    - **api**              → re-fetches the API and applies an optional SQL filter
+    Universal natural-language query endpoint.
+    Internally routes to the right AI strategy (RAG / DF agent / DB agent / etc.).
+    The user only ever sees a plain-English answer + optional data rows.
     """
-    s     = safe_source(req.source_id)
-    t0    = time.time()
-    qtype = req.query_type.lower()
-
-    # ── 1. Natural Language → generate query first ────────────────────────────
-    if qtype == "natural_language":
-        try:
-            req.query = await generate_query_from_nl(s, req.query)
-        except Exception as e:
-            raise HTTPException(502, f"AI query generation failed: {e}")
-        # now treat it as SQL (or mongodb json)
-        qtype = "mongodb" if s["type"] == "mongodb" else "sql"
-
-    # ── 2. Route by source type ───────────────────────────────────────────────
-    try:
-        if s["type"] in ("excel", "csv", "pdf", "api"):
-            df = run_pandasql(s["active"], req.query)
-
-        elif s["type"] == "sqlite":
-            con = sqlite3.connect(s["db_path"])
-            df  = pd.read_sql_query(req.query, con)
-            con.close()
-
-        elif s["type"] == "postgres":
-            cfg  = s["config"]
-            pswd = s["_password"]
-            conn = psycopg2.connect(
-                host=cfg["host"], port=cfg["port"], dbname=cfg["database"],
-                user=cfg["username"], password=pswd,
-            )
-            df   = pg_run_sql(conn, req.query, req.limit)
-            conn.close()
-
-        elif s["type"] == "mysql":
-            cfg  = s["config"]
-            pswd = s["_password"]
-            conn = pymysql.connect(
-                host=cfg["host"], port=cfg["port"], db=cfg["database"],
-                user=cfg["username"], password=pswd,
-                charset="utf8mb4", cursorclass=pymysql.cursors.DictCursor,
-            )
-            df   = my_run_sql(conn, req.query, req.limit)
-            conn.close()
-
-        elif s["type"] == "mongodb":
-            cfg = s["config"]
-            cli = pymongo.MongoClient(cfg["uri"])
-            col = cfg.get("collection", "")
-            df  = mongo_run_query(cli, cfg["database"], col, req.query, req.limit)
-            cli.close()
-
-        elif s["type"] == "bigquery":
-            cfg = s["config"]
-            df  = bq_run_sql(cfg["project_id"], req.query, s.get("_credentials"))
-
-        else:
-            raise HTTPException(400, f"Unsupported source type: {s['type']}")
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        push_history({
-            "id": new_id(), "source_id": req.source_id, "source_name": s["name"],
-            "query": req.query, "query_type": req.query_type,
-            "rows_returned": 0, "execution_time": round(time.time()-t0, 4),
-            "success": False, "error": str(e), "timestamp": now_iso(),
-        })
-        raise HTTPException(400, f"Query failed: {e}")
-
-    result = df_to_response(df, t0)
-    push_history({
-        "id": new_id(), "source_id": req.source_id, "source_name": s["name"],
-        "query": req.query, "query_type": req.query_type,
-        "rows_returned": result["row_count"],
-        "execution_time": result["execution_time"],
-        "success": True, "error": None, "timestamp": now_iso(),
+    result = await answer_question(req.source_id, req.question.strip(), req.limit)
+    _push_hist({
+        "id":             _sid(),
+        "source_id":      req.source_id,
+        "source_name":    SOURCES.get(req.source_id, {}).get("name", ""),
+        "question":       req.question,
+        "answer":         result.get("answer", ""),
+        "source_type":    result.get("source_type", ""),
+        "rows_used":      result.get("rows_used", 0),
+        "execution_time": result.get("execution_time", 0),
+        "success":        result.get("success", False),
+        "timestamp":      _now(),
     })
     return result
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  AI QUERY GENERATION
-# ─────────────────────────────────────────────────────────────────────────────
+# Keep backward-compat alias — old frontend posts to /query/run
+@app.post("/query/run", tags=["Query"])
+async def query_run_compat(req: AskRequest):
+    """Backward-compatible alias for /query/ask."""
+    return await ask(req)
+
+# ── AI generate (preview only — does NOT execute) ─────────────────────────────
 
 @app.post("/ai/generate-query", tags=["AI"])
-async def ai_generate_query(req: AIGenerateRequest):
+async def ai_generate(body: dict):
     """
-    Generate a query from natural language without executing it.
-    The frontend can display the generated query for the user to review/edit.
+    Preview what the AI would do — returns the reasoning plan (not raw SQL).
+    For transparency / debug only. The answer is not executed here.
     """
-    s = safe_source(req.source_id)
+    source_id = body.get("source_id","")
+    prompt    = body.get("prompt","")
+    if source_id not in SOURCES:
+        raise HTTPException(404, "Source not found.")
+    stype = SOURCES[source_id]["type"]
+    plan  = {
+        "pdf":      "Will use RAG: extract relevant chunks → LLM answers from context",
+        "excel":    "Will analyse the dataframe: send schema + sample rows to LLM",
+        "csv":      "Will analyse the dataframe: send schema + sample rows to LLM",
+        "postgres": "Will query database internally: schema → SQL → execute → narrate",
+        "mysql":    "Will query database internally: schema → SQL → execute → narrate",
+        "sqlite":   "Will query database internally: schema → SQL → execute → narrate",
+        "bigquery": "Will query BigQuery internally: schema → SQL → execute → narrate",
+        "mongodb":  "Will use aggregation pipeline internally → narrate result",
+        "api":      "Will fetch API → convert to dataframe → LLM answers",
+    }.get(stype, "Will use universal AI reasoning")
+    return {"generated_query": f"[{stype.upper()} ENGINE] {plan}", "strategy": plan}
+
+# ── Sources — file uploads ─────────────────────────────────────────────────────
+
+@app.post("/sources/excel/upload", tags=["Sources"])
+async def upload_excel(name: str = Form(...), file: UploadFile = File(...)):
+    fn = file.filename or ""
+    if not fn.lower().endswith((".xls",".xlsx",".csv")):
+        raise HTTPException(400, "Only .xls, .xlsx, .csv accepted.")
+    content = await file.read()
+    data    = process_csv(content, fn) if fn.endswith(".csv") else process_excel(content, fn)
+    sid     = _sid()
+    SOURCES[sid] = {"id":sid,"name":name or fn,"type":"excel" if not fn.endswith(".csv") else "csv",
+                    "created_at":_now(),"status":"connected",**data}
+    return {"source_id":sid,"name":SOURCES[sid]["name"],"type":SOURCES[sid]["type"],
+            "rows":len(SOURCES[sid]["active"]),"columns":SOURCES[sid]["active"].columns.tolist(),
+            "sheets":SOURCES[sid].get("sheets",[]),"schema":SOURCES[sid]["schema"]}
+
+@app.post("/sources/pdf/upload", tags=["Sources"])
+async def upload_pdf(name: str = Form(...), file: UploadFile = File(...)):
+    fn = file.filename or ""
+    if not fn.lower().endswith(".pdf"):
+        raise HTTPException(400, "Only .pdf accepted.")
+    content = await file.read()
+    data    = process_pdf(content, fn)
+    sid     = _sid()
+    SOURCES[sid] = {"id":sid,"name":name or fn,"type":"pdf",
+                    "created_at":_now(),"status":"connected",**data}
+    log.info("PDF loaded: %d pages, full_text=%d chars",
+             len(data["pages"]), len(data["full_text"]))
+    return {"source_id":sid,"name":SOURCES[sid]["name"],"type":"pdf",
+            "page_count":len(data["pages"]),"table_count":len(data["tables"]),
+            "char_count":len(data["full_text"]),"schema":data["schema"]}
+
+@app.post("/sources/sqlite/upload", tags=["Sources"])
+async def upload_sqlite(name: str = Form(...), file: UploadFile = File(...)):
+    fn = file.filename or ""
+    if not fn.lower().endswith((".db",".sqlite",".sqlite3")):
+        raise HTTPException(400, "Only .db/.sqlite/.sqlite3 accepted.")
+    content = await file.read()
+    data    = process_sqlite(content, fn)
+    sid     = _sid()
+    SOURCES[sid] = {"id":sid,"name":name or fn,"type":"sqlite",
+                    "created_at":_now(),"status":"connected",**data}
+    return {"source_id":sid,"name":SOURCES[sid]["name"],"type":"sqlite",
+            "tables":data["tables"],"schema":data["schema"]}
+
+# ── Sources — DB connections ──────────────────────────────────────────────────
+
+@app.post("/sources/postgres/connect", tags=["Sources"])
+async def connect_postgres(cfg: ConnectPostgres):
+    if not _PG: raise HTTPException(500,"psycopg2 not installed.")
     try:
-        generated = await generate_query_from_nl(s, req.prompt)
+        conn   = psycopg2.connect(host=cfg.host,port=cfg.port,dbname=cfg.database,
+                                   user=cfg.username,password=cfg.password,connect_timeout=10)
+        schema = _pg_schema(conn); conn.close()
     except Exception as e:
-        raise HTTPException(502, f"AI generation failed: {e}")
-    return {
-        "source_id":       req.source_id,
-        "source_type":     s["type"],
-        "prompt":          req.prompt,
-        "generated_query": generated,
-    }
+        raise HTTPException(400, f"PostgreSQL error: {e}")
+    sid = _sid()
+    SOURCES[sid] = {"id":sid,"name":cfg.name,"type":"postgres",
+                    "config":cfg.dict(exclude={"password"}),"_password":cfg.password,
+                    "schema":schema,"created_at":_now(),"status":"connected"}
+    return {"source_id":sid,"name":cfg.name,"type":"postgres",
+            "tables":list(schema),"schema":schema}
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  EXPORT
-# ─────────────────────────────────────────────────────────────────────────────
+@app.post("/sources/mysql/connect", tags=["Sources"])
+async def connect_mysql(cfg: ConnectMySQL):
+    if not _MY: raise HTTPException(500,"pymysql not installed.")
+    try:
+        conn   = pymysql.connect(host=cfg.host,port=cfg.port,db=cfg.database,
+                                  user=cfg.username,password=cfg.password,
+                                  charset="utf8mb4",cursorclass=pymysql.cursors.DictCursor,
+                                  connect_timeout=10)
+        schema = _my_schema(conn); conn.close()
+    except Exception as e:
+        raise HTTPException(400, f"MySQL error: {e}")
+    sid = _sid()
+    SOURCES[sid] = {"id":sid,"name":cfg.name,"type":"mysql",
+                    "config":cfg.dict(exclude={"password"}),"_password":cfg.password,
+                    "schema":schema,"created_at":_now(),"status":"connected"}
+    return {"source_id":sid,"name":cfg.name,"type":"mysql",
+            "tables":list(schema),"schema":schema}
 
-@app.post("/export/csv", tags=["Export"])
-async def export_csv(req: ExportRequest):
-    """Export result rows as a CSV file."""
-    df   = rows_to_df(req.rows, req.columns)
-    data = make_csv(df)
-    return streaming_file(data, "text/csv", f"{req.filename}.csv")
+@app.post("/sources/mongodb/connect", tags=["Sources"])
+async def connect_mongodb(cfg: ConnectMongo):
+    if not _MONGO: raise HTTPException(500,"pymongo not installed.")
+    try:
+        client = pymongo.MongoClient(cfg.uri, serverSelectionTimeoutMS=10_000)
+        client.admin.command("ping")
+        cols   = client[cfg.database].list_collection_names()
+        schema = {}
+        for col in cols:
+            sample = client[cfg.database][col].find_one()
+            if sample:
+                sample.pop("_id",None)
+                schema[col] = list(_flatten(sample).keys())
+            else:
+                schema[col] = []
+        client.close()
+    except Exception as e:
+        raise HTTPException(400, f"MongoDB error: {e}")
+    sid = _sid()
+    SOURCES[sid] = {"id":sid,"name":cfg.name,"type":"mongodb",
+                    "config":cfg.dict(),"schema":schema,
+                    "created_at":_now(),"status":"connected"}
+    return {"source_id":sid,"name":cfg.name,"type":"mongodb",
+            "collections":cols,"schema":schema}
 
+@app.post("/sources/api/connect", tags=["Sources"])
+async def connect_api(cfg: ConnectAPI):
+    try:
+        async with httpx.AsyncClient(timeout=QUERY_TIMEOUT) as c:
+            resp = await c.request(cfg.method,cfg.url,
+                                   headers=cfg.headers,params=cfg.params)
+        resp.raise_for_status()
+        df = _json_to_df(resp.json())
+    except Exception as e:
+        raise HTTPException(400, f"API error: {e}")
+    sid = _sid()
+    SOURCES[sid] = {"id":sid,"name":cfg.name,"type":"api",
+                    "config":cfg.dict(),"active":df,
+                    "schema":{"api":_df_schema(df,"api")},
+                    "created_at":_now(),"status":"connected"}
+    return {"source_id":sid,"name":cfg.name,"type":"api",
+            "columns":df.columns.tolist(),"row_count":len(df),
+            "schema":SOURCES[sid]["schema"]}
 
-@app.post("/export/excel", tags=["Export"])
-async def export_excel(req: ExportRequest):
-    """Export result rows as an Excel (.xlsx) file."""
-    df   = rows_to_df(req.rows, req.columns)
-    data = make_xlsx(df)
-    mt   = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    return streaming_file(data, mt, f"{req.filename}.xlsx")
+@app.post("/sources/bigquery/connect", tags=["Sources"])
+async def connect_bigquery(cfg: ConnectBigQuery):
+    if not _BQ: raise HTTPException(500,"google-cloud-bigquery not installed.")
+    sid = _sid()
+    SOURCES[sid] = {"id":sid,"name":cfg.name,"type":"bigquery",
+                    "config":cfg.dict(exclude={"credentials"}),
+                    "_credentials":cfg.credentials,
+                    "schema":{},"created_at":_now(),"status":"connected"}
+    return {"source_id":sid,"name":cfg.name,"type":"bigquery",
+            "project_id":cfg.project_id,"dataset_id":cfg.dataset_id}
 
+# ── Source CRUD ───────────────────────────────────────────────────────────────
 
-@app.post("/export/json", tags=["Export"])
-async def export_json_file(req: ExportRequest):
-    """Export result rows as a JSON file."""
-    df   = rows_to_df(req.rows, req.columns)
-    data = make_json_bytes(df)
-    return streaming_file(data, "application/json", f"{req.filename}.json")
+@app.get("/sources", tags=["Sources"])
+def list_sources():
+    return [{"id":s["id"],"name":s["name"],"type":s["type"],
+             "status":s["status"],"created_at":s["created_at"]}
+            for s in SOURCES.values()]
 
+@app.get("/sources/{sid}", tags=["Sources"])
+def get_source(sid: str):
+    s = _safe_src(sid)
+    return {"id":s["id"],"name":s["name"],"type":s["type"],"status":s["status"],
+            "created_at":s["created_at"],"schema":s.get("schema",{}),
+            "tables":s.get("tables") or s.get("sheets") or list(s.get("schema",{}))}
 
-@app.post("/export/pdf", tags=["Export"])
-async def export_pdf(req: ExportRequest):
-    """Export result rows as a styled PDF file."""
-    df   = rows_to_df(req.rows, req.columns)
-    data = make_pdf(df)
-    return streaming_file(data, "application/pdf", f"{req.filename}.pdf")
+@app.delete("/sources/{sid}", tags=["Sources"])
+def delete_source(sid: str):
+    _safe_src(sid)
+    del SOURCES[sid]
+    return {"deleted": sid}
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  QUERY HISTORY
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Schema ────────────────────────────────────────────────────────────────────
+
+@app.get("/schema/{sid}", tags=["Schema"])
+def get_schema(sid: str):
+    s = _safe_src(sid)
+    return {"source_id":sid,"type":s["type"],"schema":s.get("schema",{})}
+
+@app.get("/tables/{sid}", tags=["Schema"])
+def get_tables(sid: str):
+    s = _safe_src(sid)
+    tables = s.get("tables") or s.get("collections") or s.get("sheets") or list(s.get("schema",{}))
+    return {"source_id":sid,"type":s["type"],"tables":tables}
+
+@app.get("/columns/{sid}/{table}", tags=["Schema"])
+def get_columns(sid: str, table: str):
+    s = _safe_src(sid)
+    schema = s.get("schema",{})
+    if table not in schema:
+        raise HTTPException(404, f"Table '{table}' not found.")
+    return {"source_id":sid,"table":table,"columns":schema[table]}
+
+# ── History ───────────────────────────────────────────────────────────────────
 
 @app.get("/history", tags=["History"])
-def get_history(
-    limit:     int           = Query(50, ge=1, le=200),
-    source_id: Optional[str] = Query(None),
-):
-    """Return query history, newest first. Filter by source_id optionally."""
-    hist = HISTORY
-    if source_id:
-        hist = [h for h in hist if h["source_id"] == source_id]
-    return {"history": hist[:limit], "total": len(hist)}
-
-
-@app.post("/history", tags=["History"])
-def add_history(entry: HistoryEntry):
-    """Manually add a history entry (e.g. client-side queries)."""
-    record = entry.dict()
-    record["id"]        = new_id()
-    record["timestamp"] = now_iso()
-    push_history(record)
-    return record
-
+def get_history(limit: int = Query(50, ge=1, le=200)):
+    return {"history": HISTORY[:limit], "total": len(HISTORY)}
 
 @app.delete("/history", tags=["History"])
-def clear_history(source_id: Optional[str] = Query(None)):
-    """Clear all history, or only for a specific source."""
-    global HISTORY
-    if source_id:
-        HISTORY = [h for h in HISTORY if h["source_id"] != source_id]
-    else:
-        HISTORY = []
-    return {"cleared": True, "remaining": len(HISTORY)}
+def clear_history():
+    global HISTORY; HISTORY = []
+    return {"cleared": True}
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  GLOBAL ERROR HANDLER
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Export ────────────────────────────────────────────────────────────────────
+
+@app.post("/export/csv",   tags=["Export"])
+def export_csv(req: ExportRequest):
+    return _stream(_make_csv(_rows_to_df(req.rows,req.columns)),
+                   "text/csv", f"{req.filename}.csv")
+
+@app.post("/export/excel", tags=["Export"])
+def export_excel(req: ExportRequest):
+    return _stream(_make_xlsx(_rows_to_df(req.rows,req.columns)),
+                   "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                   f"{req.filename}.xlsx")
+
+@app.post("/export/json",  tags=["Export"])
+def export_json(req: ExportRequest):
+    return _stream(_make_json(_rows_to_df(req.rows,req.columns)),
+                   "application/json", f"{req.filename}.json")
+
+@app.post("/export/pdf",   tags=["Export"])
+def export_pdf_file(req: ExportRequest):
+    return _stream(_make_pdf_file(_rows_to_df(req.rows,req.columns)),
+                   "application/pdf", f"{req.filename}.pdf")
+
+# ── Catch-all error handler ───────────────────────────────────────────────────
 
 @app.exception_handler(Exception)
-async def global_exception_handler(request: Request, exc: Exception):
-    log.exception("Unhandled error: %s %s", request.method, request.url)
-    return JSONResponse(
-        status_code=500,
-        content={"detail": f"Internal server error: {type(exc).__name__}: {exc}"},
-    )
+async def _global_err(req: Request, exc: Exception):
+    log.exception("Unhandled: %s %s", req.method, req.url)
+    return JSONResponse(500, {"detail": f"{type(exc).__name__}: {exc}"})
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  DEV ENTRYPOINT
-# ─────────────────────────────────────────────────────────────────────────────
-
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
