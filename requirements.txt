@@ -21,6 +21,8 @@ scikit-learn==1.7.1
 
 psycopg2-binary==2.9.10
 
+pandasql==0.7.3
+
 pymysql==1.1.1
 
 pymongo==4.14.1
